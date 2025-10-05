@@ -8,86 +8,131 @@ load_dotenv()
 intens = discord.Intents.default()
 intens.message_content = True
 
-FFMPEG_OPTIONS = {'options' : '-vn'}
+FFMPEG_OPTIONS = {'options': '-vn'}
 YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist': True}
 
 class MusicBot(commands.Cog):
-    def __init__(self, client):
+    def __init__(self, client: commands.Bot):
         self.client = client
         self.queue = []
+        self.play_channel = None # Store the channel to send "Now playing" messages
 
-    @commands.command()
-    async def play(self, ctx, *, search):
-        voice_channel = ctx.author.voice.channel if ctx.author.voice else None
+    @app_commands.command(name="play", description="Play a song from YouTube")
+    @app_commands.describe(search="The song or video to search for on YouTube")
+    async def play(self, interaction: discord.Interaction, search: str):
+        voice_channel = interaction.user.voice.channel if interaction.user.voice else None
         if not voice_channel:
-            return await ctx.send(f"You're not in a voice channel!")
-        if not ctx.voice_client:
+            return await interaction.response.send_message(f"You're not in a voice channel!", ephemeral=True)
+        
+        await interaction.response.defer()
+        
+        # Set the channel for future "Now playing" messages
+        self.play_channel = interaction.channel
+
+        if not interaction.guild.voice_client:
             await voice_channel.connect()
 
-        async with ctx.typing():
-
-            with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl: # type: ignore
+        try:
+            with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
                 info = ydl.extract_info(f"ytsearch:{search}", download=False)
                 if 'entries' in info:
                     info = info['entries'][0]
                 
-                url = info['url'] if 'url' in info else 'Unknown'
-                title = info['title'] if 'title' in info else 'Unknown'
+                url = info['url']
+                title = info['title']
 
                 self.queue.append((url, title))
-                await ctx.send(f"Added to queue: **{title}**")
+                await interaction.followup.send(f"Added to queue: **{title}**")
             
-        if not ctx.voice_client.is_playing():
-            await self.play_next(ctx)
+            if not interaction.guild.voice_client.is_playing():
+                await self.play_next()
+        except Exception as e:
+            await interaction.followup.send(f"An error occurred: {e}")
 
-    async def play_next(self, ctx):
+    async def play_next(self):
+        # Use the stored channel instead of the interaction object
+        if self.play_channel is None:
+            return # Don't do anything if we don't have a channel
 
         if self.queue:
             url, title = self.queue.pop(0)
-            source = await discord.FFmpegOpusAudio.from_probe(url, **FFMPEG_OPTIONS)
-            ctx.voice_client.play(source, after=lambda _:self.client.loop.create_task(self.play_next(ctx)))
-            await ctx.send(f'Now playing **{title}**')
-        elif not ctx.voice_client.is_playing():
-            await ctx.send("queue is empty!")
-        
-    @commands.command()
-    async def skip(self, ctx):
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-            await ctx.send("Skipped")
+            try:
+                source = await discord.FFmpegOpusAudio.from_probe(url, **FFMPEG_OPTIONS)
+                vc = self.play_channel.guild.voice_client
+                # The after callback no longer needs the interaction
+                vc.play(source, after=lambda e: self.client.loop.create_task(self.play_next()) if e is None else print(f"Player error: {e}"))
+                await self.play_channel.send(f'Now playing **{title}**')
+            except Exception as e:
+                print(f"Error playing next song: {e}")
+                await self.play_channel.send(f"Could not play the next song: **{title}**")
+                # Try to play the next song in the queue
+                await self.play_next()
+        elif not self.play_channel.guild.voice_client.is_playing():
+            await self.play_channel.send("Queue is empty!")
 
-    @commands.command()
-    async def pause(self, ctx):
-        """Pause / resume the current track."""
-        vc = ctx.voice_client
-        if not vc or not vc.is_connected():
-            return await ctx.send("I'm not in a voice channel.")
-        
-        if vc.is_paused():          # already paused → resume
-            vc.resume()
-            await ctx.send("▶️ Resumed.")
-        elif vc.is_playing():       # playing → pause
-            vc.pause()
-            await ctx.send("⏸️ Paused.")
+    @app_commands.command(name="skip", description="Skip the currently playing song")
+    async def skip(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            vc.stop()
+            await interaction.response.send_message("Skipped")
         else:
-            await ctx.send("Nothing is playing right now.")
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
-    @commands.command()
-    async def stop(self, ctx):
-        """Stop playback, clear the queue and leave the channel."""
-        vc = ctx.voice_client
+    @app_commands.command(name="pause", description="Pause or resume the current track")
+    async def pause(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
         if not vc or not vc.is_connected():
-            return await ctx.send("I'm not in a voice channel.")
+            return await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
+        
+        if vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("▶️ Resumed.")
+        elif vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("⏸️ Paused.")
+        else:
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
-        self.queue.clear()          # empty the queue
-        vc.stop()                   # stop current track
+    @app_commands.command(name="stop", description="Stop playback, clear the queue and leave the channel")
+    async def stop(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            return await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
+
+        self.queue.clear()
+        self.play_channel = None # Clear the channel when stopping
+        vc.stop()
         await vc.disconnect()
-        await ctx.send("⏹️ Stopped and cleared the queue.")
+        await interaction.response.send_message("⏹️ Stopped and cleared the queue.")
 
+# Use commands.Bot to get access to the 'tree'
 client = commands.Bot(command_prefix="!", intents=intens)
+
+@client.event
+async def on_ready():
+    print(f'Logged in as {client.user} (ID: {client.user.id})')
+    print('------')
+    
+    # Sync commands to a specific guild for instant updates.
+    # This is highly recommended for development.
+    # Replace YOUR_GUILD_ID with your actual server ID.
+    # To get your server ID, right-click your server icon in Discord and click "Copy Server ID".
+    # You may need to enable Developer Mode in your Discord settings (User Settings > Advanced > Developer Mode).
+    GUILD_ID = os.getenv("GUILD_ID") # Recommended: Store guild ID in .env
+    if GUILD_ID:
+        guild_object = discord.Object(id=int(GUILD_ID))
+        await client.tree.sync(guild=guild_object)
+        print(f"Synced commands to guild {GUILD_ID}")
+    else:
+        # If no GUILD_ID is set, sync globally (can take up to an hour).
+        await client.tree.sync()
+        print("Synced commands globally. This may take up to an hour to update.")
+    
+    print('Bot is ready.')
 
 async def main():
     await client.add_cog(MusicBot(client))
-    await client.start(os.getenv("BOT_TOKEN")) # type: ignore
+    await client.start(os.getenv("BOT_TOKEN"))
 
 asyncio.run(main())
